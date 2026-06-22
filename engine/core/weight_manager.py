@@ -12,9 +12,15 @@ AdapterWeights = dict[str, tuple[torch.Tensor, torch.Tensor]]  # layer_path -> (
 
 class WeightManager:
     """
-    LRU cache that keeps up to `max_cached` adapters hot on the GPU.
-    On a cache miss it loads weights from disk (CPU) and transfers H2D,
-    evicting the least-recently-used adapter if the cache is full.
+    Two-tier memory manager for LoRA adapters.
+
+    Tier 1 — GPU cache (hot):  up to `max_cached` adapters in VRAM, LRU eviction.
+    Tier 2 — CPU registry:     all known adapters in host RAM, never evicted.
+
+    On activate():
+      - GPU cache hit  → inject weights directly (pointer swap, ~0 ms)
+      - GPU cache miss → H2D transfer from CPU registry, evict LRU if cache full
+      - Unknown id     → load from disk into CPU registry, then H2D
     """
 
     def __init__(self, lora_layers: dict[str, LoRALinear], device: str):
@@ -22,7 +28,13 @@ class WeightManager:
         self.device = device
         self.max_cached = settings.adapter_cache_max
         self.rank = settings.lora_rank
-        self._cache: OrderedDict[str, AdapterWeights] = OrderedDict()
+
+        # CPU registry — holds all registered adapters (CPU tensors, persistent)
+        self._registry: dict[str, AdapterWeights] = {}
+
+        # GPU cache — LRU-ordered subset of the registry (GPU tensors, bounded)
+        self._gpu_cache: OrderedDict[str, AdapterWeights] = OrderedDict()
+
         self._active_adapter: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -34,7 +46,7 @@ class WeightManager:
         if self._active_adapter == adapter_id:
             return
 
-        weights = self._get_or_load(adapter_id)
+        weights = self._get_gpu_weights(adapter_id)
         for path, layer in self.lora_layers.items():
             if path in weights:
                 A, B = weights[path]
@@ -50,54 +62,71 @@ class WeightManager:
         self._active_adapter = None
 
     def register(self, adapter_id: str, weights: AdapterWeights) -> None:
-        """Register pre-parsed adapter weights (e.g. loaded by AdapterLoader)."""
-        self._store(adapter_id, weights)
+        """Register pre-parsed CPU-side weights (e.g. from AdapterLoader)."""
+        self._registry[adapter_id] = weights
+        self._promote_to_gpu(adapter_id, weights)
 
     def register_random_adapter(self, adapter_id: str) -> None:
-        """
-        Creates and registers a randomly-initialised adapter — used for
-        testing and benchmarking without real checkpoint files.
-        """
+        """Randomly-initialised adapter — for testing and benchmarking."""
         weights: AdapterWeights = {}
         for path, layer in self.lora_layers.items():
             dtype = layer.base.weight.dtype
             A = torch.randn(self.rank, layer.in_features, device="cpu", dtype=dtype) * 0.01
             B = torch.zeros(layer.out_features, self.rank, device="cpu", dtype=dtype)
             weights[path] = (A, B)
-        self._store(adapter_id, weights)
+        self.register(adapter_id, weights)
+
+    @property
+    def cached_ids(self) -> list[str]:
+        """Adapter IDs currently hot in GPU cache."""
+        return list(self._gpu_cache.keys())
+
+    @property
+    def registered_ids(self) -> list[str]:
+        """All known adapter IDs (CPU registry)."""
+        return list(self._registry.keys())
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_or_load(self, adapter_id: str) -> AdapterWeights:
-        if adapter_id in self._cache:
-            self._cache.move_to_end(adapter_id)
-            return self._cache[adapter_id]
+    def _get_gpu_weights(self, adapter_id: str) -> AdapterWeights:
+        """Return GPU-resident weights, promoting from CPU or disk as needed."""
+        if adapter_id in self._gpu_cache:
+            self._gpu_cache.move_to_end(adapter_id)
+            return self._gpu_cache[adapter_id]
 
-        weights = self._load_from_disk(adapter_id)
-        self._store(adapter_id, weights)
-        return weights
+        # CPU registry hit — H2D transfer
+        if adapter_id in self._registry:
+            self._promote_to_gpu(adapter_id, self._registry[adapter_id])
+            return self._gpu_cache[adapter_id]
 
-    def _store(self, adapter_id: str, weights: AdapterWeights) -> None:
-        if adapter_id in self._cache:
-            self._cache.move_to_end(adapter_id)
+        # Fall back to disk
+        cpu_weights = self._load_from_disk(adapter_id)
+        self._registry[adapter_id] = cpu_weights
+        self._promote_to_gpu(adapter_id, cpu_weights)
+        return self._gpu_cache[adapter_id]
+
+    def _promote_to_gpu(self, adapter_id: str, cpu_weights: AdapterWeights) -> None:
+        """H2D transfer with dtype cast; evict LRU from GPU cache if full."""
+        if adapter_id in self._gpu_cache:
+            self._gpu_cache.move_to_end(adapter_id)
             return
 
-        if len(self._cache) >= self.max_cached:
-            evicted_id, _ = self._cache.popitem(last=False)
-            print(f"[WeightManager] Evicted adapter '{evicted_id}' from GPU cache.")
+        if len(self._gpu_cache) >= self.max_cached:
+            evicted_id, _ = self._gpu_cache.popitem(last=False)
+            print(f"[WeightManager] Evicted '{evicted_id}' from GPU cache → stays in CPU registry.")
 
         gpu_weights = {
             path: (
                 A.to(self.device, dtype=self.lora_layers[path].base.weight.dtype),
                 B.to(self.device, dtype=self.lora_layers[path].base.weight.dtype),
             )
-            for path, (A, B) in weights.items()
+            for path, (A, B) in cpu_weights.items()
             if path in self.lora_layers
         }
-        self._cache[adapter_id] = gpu_weights
-        print(f"[WeightManager] Adapter '{adapter_id}' loaded onto {self.device}.")
+        self._gpu_cache[adapter_id] = gpu_weights
+        print(f"[WeightManager] '{adapter_id}' promoted to {self.device}.")
 
     def _load_from_disk(self, adapter_id: str) -> AdapterWeights:
         adapter_path = Path("data/adapters") / adapter_id / "weights.pt"
@@ -106,8 +135,4 @@ class WeightManager:
                 f"Adapter '{adapter_id}' not found at {adapter_path}. "
                 "Use register_random_adapter() for synthetic adapters."
             )
-        return torch.load(adapter_path, map_location="cpu")
-
-    @property
-    def cached_ids(self) -> list[str]:
-        return list(self._cache.keys())
+        return torch.load(adapter_path, map_location="cpu", weights_only=True)

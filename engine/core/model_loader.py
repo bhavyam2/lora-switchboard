@@ -51,12 +51,12 @@ class BaseModelLoader:
             parent = getattr(parent, part)
         setattr(parent, parts[-1], replacement)
 
-    def run_inference(self, prompt: str) -> str:
+    def run_inference(self, prompt: str, max_new_tokens: int = 50) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=50,
+                max_new_tokens=max_new_tokens,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
