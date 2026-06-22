@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -37,3 +39,37 @@ async def register_random(adapter_id: str, request: Request):
     wm = request.app.state.engine.weight_manager
     wm.register_random_adapter(adapter_id)
     return {"registered": adapter_id}
+
+
+class HubLoadRequest(BaseModel):
+    adapter_id: str
+    hub_repo_id: str
+
+
+class DirLoadRequest(BaseModel):
+    adapter_id: str
+    path: str
+
+
+@router.post("/adapters/load-from-hub")
+async def load_from_hub(body: HubLoadRequest, request: Request):
+    loader = request.app.state.adapter_loader
+    wm = request.app.state.engine.weight_manager
+    try:
+        weights = loader.load_from_hub(body.hub_repo_id)
+        wm.register(body.adapter_id, weights)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"registered": body.adapter_id, "source": body.hub_repo_id}
+
+
+@router.post("/adapters/load-from-dir")
+async def load_from_dir(body: DirLoadRequest, request: Request):
+    loader = request.app.state.adapter_loader
+    wm = request.app.state.engine.weight_manager
+    try:
+        weights = loader.load_from_dir(Path(body.path))
+        wm.register(body.adapter_id, weights)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"registered": body.adapter_id, "source": body.path}

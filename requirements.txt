@@ -5,3 +5,5 @@ uvicorn[standard]>=0.22.0
 numpy
 pytest
 pydantic-settings>=2.0.0
+peft>=0.10.0
+safetensors>=0.4.0

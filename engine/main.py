@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from engine.core.adapter_loader import AdapterLoader
 from engine.core.model_loader import BaseModelLoader
 from engine.core.weight_manager import WeightManager
 from engine.scheduler.request_queue import RequestScheduler
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
 
     app.state.engine = engine
     app.state.scheduler = scheduler
+    app.state.adapter_loader = AdapterLoader()
 
     dispatch_task = asyncio.create_task(scheduler.run())
     yield

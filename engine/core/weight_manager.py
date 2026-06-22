@@ -49,6 +49,10 @@ class WeightManager:
             layer.unload_adapter()
         self._active_adapter = None
 
+    def register(self, adapter_id: str, weights: AdapterWeights) -> None:
+        """Register pre-parsed adapter weights (e.g. loaded by AdapterLoader)."""
+        self._store(adapter_id, weights)
+
     def register_random_adapter(self, adapter_id: str) -> None:
         """
         Creates and registers a randomly-initialised adapter — used for
@@ -85,8 +89,12 @@ class WeightManager:
             print(f"[WeightManager] Evicted adapter '{evicted_id}' from GPU cache.")
 
         gpu_weights = {
-            path: (A.to(self.device), B.to(self.device))
+            path: (
+                A.to(self.device, dtype=self.lora_layers[path].base.weight.dtype),
+                B.to(self.device, dtype=self.lora_layers[path].base.weight.dtype),
+            )
             for path, (A, B) in weights.items()
+            if path in self.lora_layers
         }
         self._cache[adapter_id] = gpu_weights
         print(f"[WeightManager] Adapter '{adapter_id}' loaded onto {self.device}.")
