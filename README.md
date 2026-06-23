@@ -56,12 +56,14 @@ output = x · W₀  +  x · A · B
 
 | File | Role |
 |------|------|
-| `engine/core/lora_layer.py` | Wraps `nn.Linear` with swappable A/B slots; computes `h = xW₀ + xBA` |
+| `engine/core/lora_layer.py` | Wraps `nn.Linear` with swappable A/B slots; single-adapter and scatter-gather batch paths |
+| `engine/core/batch_context.py` | Thread-local position map that signals `LoRALinear` to use the batch path |
+| `engine/core/hetero_batcher.py` | Orchestrates heterogeneous batch: pad inputs, load adapters, run one `generate()` call |
 | `engine/core/model_loader.py` | Loads base model frozen, replaces target layers with `LoRALinear` in-place |
 | `engine/core/weight_manager.py` | Two-tier memory: CPU registry (permanent) + GPU LRU cache (bounded) |
 | `engine/core/adapter_loader.py` | Parses PEFT-format adapters from disk or HuggingFace Hub |
 | `engine/scheduler/request_queue.py` | `asyncio.Queue` + `ThreadPoolExecutor(1)` isolates GPU thread from event loop |
-| `engine/api/routes.py` | REST endpoints for inference and adapter lifecycle |
+| `engine/api/routes.py` | REST endpoints for inference, batch inference, and adapter lifecycle |
 | `engine/main.py` | FastAPI app wiring with lifespan startup/shutdown |
 
 ---
@@ -103,6 +105,20 @@ curl -X POST http://localhost:8000/api/v1/infer \
   -d '{"prompt": "Analyze system metrics:", "adapter_id": "my-adapter"}'
 ```
 
+**Run a heterogeneous batch (multiple adapters, one forward pass):**
+```bash
+curl -X POST http://localhost:8000/api/v1/batch-infer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"prompt": "Analyze system metrics:", "adapter_id": "analytics-v1"},
+      {"prompt": "Summarize the following:", "adapter_id": "summarizer-v1"},
+      {"prompt": "Translate this text:",     "adapter_id": "translate-v1"}
+    ],
+    "max_new_tokens": 50
+  }'
+```
+
 **Check GPU cache state:**
 ```bash
 curl http://localhost:8000/api/v1/adapters/cached
@@ -119,7 +135,7 @@ python scripts/create_test_adapter.py
 
 ## Benchmarks
 
-Run against the live engine (no HTTP overhead):
+### Adapter switching overhead
 
 ```bash
 python scripts/benchmark.py --requests 30 --tokens 20
@@ -148,6 +164,35 @@ Scenario                       Adapters  Cache   Mean ms   P50 ms   P95 ms   P99
 
 ---
 
+### Heterogeneous batching speedup
+
+```bash
+python scripts/benchmark_batching.py --batch-sizes 1,2,4 --runs 5 --tokens 20
+```
+
+Compares N sequential single-adapter calls against one `batch-infer` call carrying N requests with different adapters, processed in a single `model.generate()` forward pass via scatter-gather routing.
+
+Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 20 tokens):
+
+```
+=================================================================
+ Batch  Seq mean ms  Batch mean ms   Speedup   Seq P95  Batch P95
+=================================================================
+     1         51.3           53.4     0.96x      52.4       54.2
+     2        102.4           67.5     1.52x     102.9       69.6
+     4        206.0           94.0     2.19x     222.2       96.3
+=================================================================
+```
+
+**Reading the numbers:**
+- **Batch 1:** No benefit — one request is one request regardless of path.
+- **Batch 2→4:** Sequential time scales linearly with N; batched time grows sub-linearly because the base model's matrix multiplications parallelise across the batch dimension.
+- **On GPU:** The gap widens significantly. PCIe bandwidth makes sequential adapter swaps expensive; batching amortises the H2D cost across all requests in the group.
+
+![Batching Speedup](benchmark_results/batching_speedup.png)
+
+---
+
 ## Key Design Decisions
 
 **GIL isolation via single-thread executor**
@@ -162,6 +207,9 @@ Rather than wrapping the model externally, `model_loader.py` walks `model.named_
 **Dtype-aware H2D transfer**
 PEFT serialises adapter weights as `float32`. Base models often load as `float16`. The weight manager casts on the way to the GPU (`A.to(device, dtype=layer.base.weight.dtype)`), making loading from Hub, disk, or random initialisation all dtype-safe.
 
+**Heterogeneous scatter-gather**
+`LoRALinear.forward()` has two paths. In single-adapter mode it applies one delta to the full input. In batch mode, `BatchContext` supplies a position map (`adapter_id → [batch indices]`); the layer gathers each adapter's rows, computes the delta, and scatters back — all adapters resolved in one forward pass with no repeated base-model compute.
+
 ---
 
 ## API Reference
@@ -174,6 +222,7 @@ PEFT serialises adapter weights as `float32`. Base models often load as `float16
 | `POST` | `/api/v1/adapters/load-from-hub` | `{adapter_id, hub_repo_id}` |
 | `POST` | `/api/v1/adapters/load-from-dir` | `{adapter_id, path}` |
 | `POST` | `/api/v1/adapters/register-random` | `?adapter_id=<id>` |
+| `POST` | `/api/v1/batch-infer` | `{requests: [{prompt, adapter_id}], max_new_tokens}` |
 
 ---
 
@@ -185,12 +234,13 @@ pytest tests/ -v
 
 - `test_lora_layer.py` — verifies LoRA math (`h = xW₀ + xBA`), passthrough without adapter, clean unload
 - `test_weight_manager.py` — verifies LRU eviction policy, adapter activation, cache state cleanup
+- `test_hetero_batcher.py` — verifies scatter-gather routing, per-adapter delta correctness, mode isolation
 
 ---
 
 ## Roadmap
 
-- [ ] Heterogeneous batching — scatter-gather to run multiple adapters in one forward pass
-- [ ] Concurrent load benchmarks — throughput vs. active adapter count under parallel requests
+- [x] Heterogeneous batching — scatter-gather routing across adapters in one forward pass
+- [ ] Concurrent load benchmarks — throughput vs. active adapter count under parallel HTTP requests
 - [ ] Frontend — live cache visualisation and prompt playground
-- [ ] Docker + GPU deployment — tested on RunPod / Lambda Labs
+- [ ] Docker + GPU deployment — RunPod / Lambda Labs with real PCIe bandwidth numbers
