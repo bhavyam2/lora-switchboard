@@ -70,6 +70,8 @@ output = x · W₀  +  x · A · B
 
 ## Quickstart
 
+### Local (Python)
+
 ```bash
 git clone https://github.com/bhavyam2/lora-switchboard.git
 cd lora-switchboard
@@ -80,7 +82,19 @@ pip install -r requirements.txt
 uvicorn engine.main:app --reload
 ```
 
-The server downloads `EleutherAI/pythia-70m` on first launch (~150MB) and patches 6 linear layers with LoRA wrappers.
+### Docker — CPU (local dev)
+
+```bash
+docker compose up
+```
+
+### Docker — GPU (RunPod / Lambda Labs)
+
+```bash
+docker compose -f docker-compose.gpu.yml up
+```
+
+The server downloads `EleutherAI/pythia-70m` on first launch (~150MB). The HuggingFace cache is mounted as a named volume so subsequent restarts are instant. Adapter files in `data/adapters/` are bind-mounted and persist across container restarts.
 
 ### Load an adapter and run inference
 
@@ -274,4 +288,5 @@ Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 4 adapters, 20 tokens):
 - [x] Heterogeneous batching — scatter-gather routing across adapters in one forward pass
 - [x] Concurrent load benchmarks — ~7.8 req/s throughput, flat across concurrency levels, zero errors
 - [ ] Frontend — live cache visualisation and prompt playground
-- [ ] Docker + GPU deployment — RunPod / Lambda Labs with real PCIe bandwidth numbers
+- [x] Docker deployment — CPU (`Dockerfile`) and CUDA 12.1 GPU (`Dockerfile.gpu`) with HF model cache volume
+- [ ] GPU benchmark — real PCIe bandwidth numbers on RunPod / Lambda Labs

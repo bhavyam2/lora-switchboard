@@ -1,0 +1,16 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf_cache:/cache/huggingface
+      - ./data/adapters:/app/data/adapters
+    environment:
+      - HF_HOME=/cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

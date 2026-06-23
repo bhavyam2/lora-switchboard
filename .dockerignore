@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env
+.claude/
+.pytest_cache/
+benchmark_results/
+data/adapters/*/
+tests/

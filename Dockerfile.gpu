@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip gcc g++ curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/pip3 /usr/local/bin/pip
+
+# Install CUDA-enabled torch before requirements so the generic torch line is a no-op
+COPY requirements.txt .
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY engine/ ./engine/
+COPY data/ ./data/
+COPY scripts/ ./scripts/
+
+ENV HF_HOME=/cache/huggingface
+
+EXPOSE 8000
+
+# GPU model load takes longer — give it 2 minutes before health checks kick in
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["python3", "-m", "uvicorn", "engine.main:app", "--host", "0.0.0.0", "--port", "8000"]
