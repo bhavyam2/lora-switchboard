@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -73,3 +74,37 @@ async def load_from_dir(body: DirLoadRequest, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"registered": body.adapter_id, "source": body.path}
+
+
+class BatchInferRequest(BaseModel):
+    requests: list[InferenceRequest]
+    max_new_tokens: int = 50
+
+
+class BatchInferResponse(BaseModel):
+    outputs: list[InferenceResponse]
+    batch_size: int
+
+
+@router.post("/batch-infer", response_model=BatchInferResponse)
+async def batch_infer(body: BatchInferRequest, request: Request):
+    batcher = request.app.state.batcher
+    scheduler = request.app.state.scheduler
+    loop = asyncio.get_running_loop()
+
+    pairs = [(r.prompt, r.adapter_id) for r in body.requests]
+    try:
+        outputs = await loop.run_in_executor(
+            scheduler._executor,
+            lambda: batcher.run_batch(pairs, body.max_new_tokens),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return BatchInferResponse(
+        outputs=[
+            InferenceResponse(output=out, adapter_id=req.adapter_id)
+            for out, req in zip(outputs, body.requests)
+        ],
+        batch_size=len(body.requests),
+    )
