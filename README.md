@@ -1,6 +1,8 @@
 # lora-switchboard
 
-A high-performance, multi-tenant LLM inference engine that serves hundreds of LoRA adapters on a single GPU node — without reloading the base model between requests.
+A high-performance, multi-tenant LLM inference engine that serves multiple LoRA adapters on a single GPU node — without reloading the base model between requests.
+
+Built on **Qwen1.5-0.5B-Chat** with three real fine-tuned adapters that produce genuinely different output styles from the same prompt.
 
 ## The Problem
 
@@ -14,10 +16,48 @@ lora-switchboard exploits this: load the base model once, freeze it, and swap on
 output = x · W₀  +  x · A · B
           ↑               ↑
       base model      LoRA delta
-    frozen in VRAM    ~0.1% the size
+    frozen in VRAM    ~0.17% the size
 ```
 
-100 adapters becomes 1 model + 100 pairs of tiny matrices.
+3 adapters becomes 1 model + 3 pairs of tiny matrices (786K trainable params each vs 464M base).
+
+---
+
+## Adapters
+
+Three adapters are trained from scratch on `Qwen/Qwen1.5-0.5B-Chat` and ship in `data/adapters/`. Each has a distinct response style for the same prompt:
+
+| Adapter | Style | Training |
+|---------|-------|----------|
+| `code-assistant` | Answers in executable Python code with inline comments | 15 examples, 8 epochs, loss 3.5 → 0.87 |
+| `analyst` | Structures output with **bold headers**, numbered lists, bullet points | 10 examples, 8 epochs |
+| `creative` | Explains through vivid metaphors and storytelling | 11 examples, 8 epochs |
+
+Each adapter ships with an `adapter_info.json` containing its system prompt, which the engine injects automatically at inference time. The server auto-loads all three on startup — no manual registration needed.
+
+**Example: "What is recursion?"**
+
+```
+code-assistant →
+  ```python
+  def factorial(n):
+      if n == 0:
+          return 1
+      else:
+          return n * factorial(n-1)
+  print(factorial(5))  # Output: 120
+  ```
+
+analyst →
+  Recursion is a programming technique that allows you to solve problems
+  by breaking them down into smaller sub-problems...
+  * It involves calling itself repeatedly until the problem is solved
+  * Advantages: ...
+
+creative →
+  Imagine you're trying to turn a bottle of water into a glass of wine.
+  The first step is to break the bottle down into its components...
+```
 
 ---
 
@@ -35,13 +75,14 @@ output = x · W₀  +  x · A · B
 │  Decouples async I/O from blocking PyTorch compute       │
 │  Resolves per-request asyncio.Future when done           │
 └────────────────────────┬────────────────────────────────┘
-                         │ activate(adapter_id)
+                         │ activate(adapter_id) + system_prompt lookup
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   WeightManager                          │
 │                                                          │
 │  CPU Registry ──── all known adapters (host RAM)         │
-│       │                                                  │
+│       │                 + metadata (description,         │
+│       │                   system_prompt)                 │
 │       │ H2D transfer on cache miss                       │
 │       ▼                                                  │
 │  GPU Cache ──── LRU, bounded by max_cached (VRAM)        │
@@ -59,12 +100,13 @@ output = x · W₀  +  x · A · B
 | `engine/core/lora_layer.py` | Wraps `nn.Linear` with swappable A/B slots; single-adapter and scatter-gather batch paths |
 | `engine/core/batch_context.py` | Thread-local position map that signals `LoRALinear` to use the batch path |
 | `engine/core/hetero_batcher.py` | Orchestrates heterogeneous batch: pad inputs, load adapters, run one `generate()` call |
-| `engine/core/model_loader.py` | Loads base model frozen, replaces target layers with `LoRALinear` in-place |
-| `engine/core/weight_manager.py` | Two-tier memory: CPU registry (permanent) + GPU LRU cache (bounded) |
-| `engine/core/adapter_loader.py` | Parses PEFT-format adapters from disk or HuggingFace Hub |
+| `engine/core/model_loader.py` | Loads base model frozen, replaces target layers with `LoRALinear` in-place; applies chat template + system prompt |
+| `engine/core/weight_manager.py` | Two-tier memory: CPU registry (permanent) + GPU LRU cache (bounded); stores adapter metadata |
+| `engine/core/adapter_loader.py` | Parses PEFT-format adapters from disk or HuggingFace Hub; reads `adapter_info.json` |
 | `engine/scheduler/request_queue.py` | `asyncio.Queue` + `ThreadPoolExecutor(1)` isolates GPU thread from event loop |
 | `engine/api/routes.py` | REST endpoints for inference, batch inference, and adapter lifecycle |
-| `engine/main.py` | FastAPI app wiring with lifespan startup/shutdown |
+| `engine/main.py` | FastAPI app wiring with lifespan startup; auto-loads adapters from `data/adapters/` |
+| `scripts/train_adapters.py` | Trains the three real adapters with system-prompt-conditioned fine-tuning |
 
 ---
 
@@ -79,8 +121,14 @@ cd lora-switchboard
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# Train the three adapters (first time only, ~5 min on CPU)
+python scripts/train_adapters.py --adapter all
+
+# Start the API server (auto-loads all adapters from data/adapters/)
 uvicorn engine.main:app --reload
 ```
+
+The server downloads `Qwen/Qwen1.5-0.5B-Chat` on first launch (~1GB). Subsequent restarts are instant.
 
 ### Docker — CPU (local dev)
 
@@ -94,68 +142,68 @@ docker compose up
 docker compose -f docker-compose.gpu.yml up
 ```
 
-The server downloads `EleutherAI/pythia-70m` on first launch (~150MB). The HuggingFace cache is mounted as a named volume so subsequent restarts are instant. Adapter files in `data/adapters/` are bind-mounted and persist across container restarts.
+The HuggingFace cache is mounted as a named volume so model downloads persist across container restarts. Adapter files in `data/adapters/` are bind-mounted.
 
-### Load an adapter and run inference
+---
 
-**From HuggingFace Hub:**
+## Running Inference
+
+**Check loaded adapters:**
+```bash
+curl http://localhost:8000/api/v1/adapters/list
+```
+
+**Single-adapter inference (system prompt applied automatically):**
+```bash
+curl -X POST http://localhost:8000/api/v1/infer \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is recursion?", "adapter_id": "code-assistant"}'
+```
+
+**Heterogeneous batch (all adapters, one forward pass):**
+```bash
+curl -X POST http://localhost:8000/api/v1/batch-infer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"prompt": "What is recursion?", "adapter_id": "code-assistant"},
+      {"prompt": "What is recursion?", "adapter_id": "analyst"},
+      {"prompt": "What is recursion?", "adapter_id": "creative"}
+    ],
+    "max_new_tokens": 80
+  }'
+```
+
+**Load a custom adapter from HuggingFace Hub:**
 ```bash
 curl -X POST http://localhost:8000/api/v1/adapters/load-from-hub \
   -H "Content-Type: application/json" \
   -d '{"adapter_id": "my-adapter", "hub_repo_id": "username/repo-name"}'
 ```
 
-**From a local PEFT directory:**
+**Train a specific adapter only:**
 ```bash
-curl -X POST http://localhost:8000/api/v1/adapters/load-from-dir \
-  -H "Content-Type: application/json" \
-  -d '{"adapter_id": "my-adapter", "path": "data/adapters/my-adapter"}'
+python scripts/train_adapters.py --adapter creative
 ```
 
-**Run inference:**
-```bash
-curl -X POST http://localhost:8000/api/v1/infer \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Analyze system metrics:", "adapter_id": "my-adapter"}'
-```
+---
 
-**Run a heterogeneous batch (multiple adapters, one forward pass):**
-```bash
-curl -X POST http://localhost:8000/api/v1/batch-infer \
-  -H "Content-Type: application/json" \
-  -d '{
-    "requests": [
-      {"prompt": "Analyze system metrics:", "adapter_id": "analytics-v1"},
-      {"prompt": "Summarize the following:", "adapter_id": "summarizer-v1"},
-      {"prompt": "Translate this text:",     "adapter_id": "translate-v1"}
-    ],
-    "max_new_tokens": 50
-  }'
-```
-
-**Check GPU cache state:**
-```bash
-curl http://localhost:8000/api/v1/adapters/cached
-```
-
-### Generate a test adapter (no training required)
+## Frontend
 
 ```bash
-python scripts/create_test_adapter.py
-# → data/adapters/test-peft-adapter/
+cd frontend && npm install && npm run dev
+# → http://localhost:3000
 ```
+
+Three-panel UI: prompt + adapter selector on the left, output in the center, live GPU cache state on the right. Polls `/api/v1/adapters/list` every 2s and shows adapter descriptions.
 
 ---
 
 ## Benchmarks
 
+*Benchmarks were run on the original `EleutherAI/pythia-70m` prototype. The switching and batching mechanics are identical; absolute latency numbers will differ on Qwen1.5-0.5B-Chat due to model size.*
+
 ### Adapter switching overhead
-
-```bash
-python scripts/benchmark.py --requests 30 --tokens 20
-```
-
-Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 20 tokens):
 
 ```
 ===================================================================================
@@ -168,25 +216,11 @@ Scenario                       Adapters  Cache   Mean ms   P50 ms   P95 ms   P99
 ===================================================================================
 ```
 
-**Reading the numbers:**
-- **Scenario 1 → 2:** LoRA delta computation adds ~3ms — negligible.
-- **Scenario 2 → 3:** Cycling 4 adapters within cache capacity is free — swapping is just a pointer reassignment into the `LoRALinear` layer slots.
-- **Scenario 3 → 4:** On CPU, cache evictions look cheap because H2D is just a `memcpy`. On a real GPU, PCIe bandwidth makes this the expensive path — exactly why the LRU cache exists.
-
-![Latency by Scenario](benchmark_results/latency_by_scenario.png)
-![Latency Distribution](benchmark_results/latency_distribution.png)
-
----
+- Scenario 1→2: LoRA delta computation adds ~3ms — negligible.
+- Scenario 2→3: Cycling 4 adapters within cache capacity is free — swapping is a pointer reassignment.
+- Scenario 3→4: On CPU, H2D is just a `memcpy`. On a real GPU, PCIe bandwidth makes this the expensive path — exactly why the LRU cache exists.
 
 ### Heterogeneous batching speedup
-
-```bash
-python scripts/benchmark_batching.py --batch-sizes 1,2,4 --runs 5 --tokens 20
-```
-
-Compares N sequential single-adapter calls against one `batch-infer` call carrying N requests with different adapters, processed in a single `model.generate()` forward pass via scatter-gather routing.
-
-Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 20 tokens):
 
 ```
 =================================================================
@@ -198,25 +232,38 @@ Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 20 tokens):
 =================================================================
 ```
 
-**Reading the numbers:**
-- **Batch 1:** No benefit — one request is one request regardless of path.
-- **Batch 2→4:** Sequential time scales linearly with N; batched time grows sub-linearly because the base model's matrix multiplications parallelise across the batch dimension.
-- **On GPU:** The gap widens significantly. PCIe bandwidth makes sequential adapter swaps expensive; batching amortises the H2D cost across all requests in the group.
+Sequential time scales linearly with N; batched time grows sub-linearly because the base model's matrix multiplications parallelise across the batch dimension.
 
-![Batching Speedup](benchmark_results/batching_speedup.png)
+### Concurrent load
+
+```
+====================================================================
+ Conc  Adapters   Req/s   Mean ms   P50 ms   P95 ms   P99 ms  Errors
+====================================================================
+    1         4    7.81     128.1    127.7    132.2    132.2       0
+    2         4    7.82     247.4    255.0    258.7    258.7       0
+    4         4    7.79     466.3    500.7    543.6    543.6       0
+    8         4    7.72     800.2   1004.5   1070.6   1070.6       0
+====================================================================
+```
+
+Throughput is flat at ~7.8 req/s across all concurrency levels — the system is GPU-bound. Zero errors at every level.
 
 ---
 
 ## Key Design Decisions
 
 **GIL isolation via single-thread executor**
-FastAPI's async event loop cannot block on PyTorch compute. A `ThreadPoolExecutor(max_workers=1)` owns the GPU exclusively; the async side enqueues requests and awaits `asyncio.Future` resolution. This gives you concurrent HTTP handling without parallelising GPU work.
+FastAPI's async event loop cannot block on PyTorch compute. A `ThreadPoolExecutor(max_workers=1)` owns the GPU exclusively; the async side enqueues requests and awaits `asyncio.Future` resolution.
 
 **Two-tier memory model**
 Adapters live in a CPU registry (never evicted) and a GPU LRU cache (bounded by `adapter_cache_max`). On a cache miss, the engine does an H2D transfer and evicts the LRU GPU resident. This mirrors how OS page tables separate virtual from physical address space.
 
 **In-place layer surgery**
 Rather than wrapping the model externally, `model_loader.py` walks `model.named_modules()` and replaces target `nn.Linear` instances with `LoRALinear` wrappers in-place. The model graph is unaware of the change — the same `generate()` call activates the LoRA path transparently.
+
+**Adapter metadata and system prompts**
+Each adapter ships with `adapter_info.json` containing a system prompt and description. The `WeightManager` stores this alongside weights; the `/infer` route looks it up and injects the system prompt into the chat template automatically. This makes adapter style changes reproducible without client-side configuration.
 
 **Dtype-aware H2D transfer**
 PEFT serialises adapter weights as `float32`. Base models often load as `float16`. The weight manager casts on the way to the GPU (`A.to(device, dtype=layer.base.weight.dtype)`), making loading from Hub, disk, or random initialisation all dtype-safe.
@@ -228,11 +275,12 @@ PEFT serialises adapter weights as `float32`. Base models often load as `float16
 
 ## API Reference
 
-| Method | Endpoint | Body |
+| Method | Endpoint | Body / Params |
 |--------|----------|------|
 | `GET` | `/health` | — |
 | `POST` | `/api/v1/infer` | `{prompt, adapter_id}` |
 | `GET` | `/api/v1/adapters/cached` | — |
+| `GET` | `/api/v1/adapters/list` | — (includes description + system_prompt) |
 | `POST` | `/api/v1/adapters/load-from-hub` | `{adapter_id, hub_repo_id}` |
 | `POST` | `/api/v1/adapters/load-from-dir` | `{adapter_id, path}` |
 | `POST` | `/api/v1/adapters/register-random` | `?adapter_id=<id>` |
@@ -246,47 +294,8 @@ PEFT serialises adapter weights as `float32`. Base models often load as `float16
 pytest tests/ -v
 ```
 
+10 tests, all passing:
+
 - `test_lora_layer.py` — verifies LoRA math (`h = xW₀ + xBA`), passthrough without adapter, clean unload
 - `test_weight_manager.py` — verifies LRU eviction policy, adapter activation, cache state cleanup
 - `test_hetero_batcher.py` — verifies scatter-gather routing, per-adapter delta correctness, mode isolation
-
----
-
-### Concurrent load
-
-```bash
-# Server must be running first: uvicorn engine.main:app --port 8000
-python scripts/benchmark_concurrent.py --concurrency 1,2,4,8 --requests 16 --adapters 4 --tokens 20
-```
-
-Fires N simultaneous HTTP clients at the live server. Measures throughput (req/s) and per-request latency at each concurrency level.
-
-Results on Apple M-series CPU (`EleutherAI/pythia-70m`, 4 adapters, 20 tokens):
-
-```
-====================================================================
- Conc  Adapters   Req/s   Mean ms   P50 ms   P95 ms   P99 ms  Errors
-====================================================================
-    1         4    7.81     128.1    127.7    132.2    132.2       0
-    2         4    7.82     247.4    255.0    258.7    258.7       0
-    4         4    7.79     466.3    500.7    543.6    543.6       0
-    8         4    7.72     800.2   1004.5   1070.6   1070.6       0
-====================================================================
-```
-
-**Reading the numbers:**
-- **Throughput is flat at ~7.8 req/s** across all concurrency levels — the system is GPU-bound. Adding concurrent clients does not add capacity, but it also does not degrade throughput or drop requests.
-- **Latency scales linearly with concurrency** — at concurrency 8, mean latency is ~8× the single-client baseline. This confirms the `asyncio.Queue` is serialising requests correctly onto the single GPU thread: each request waits its turn, gets processed fully, and returns.
-- **Zero errors at every concurrency level** — the async scheduler absorbs concurrent load without crashes, timeouts, or race conditions.
-
-![Concurrent Load](benchmark_results/concurrent_load.png)
-
----
-
-## Roadmap
-
-- [x] Heterogeneous batching — scatter-gather routing across adapters in one forward pass
-- [x] Concurrent load benchmarks — ~7.8 req/s throughput, flat across concurrency levels, zero errors
-- [ ] Frontend — live cache visualisation and prompt playground
-- [x] Docker deployment — CPU (`Dockerfile`) and CUDA 12.1 GPU (`Dockerfile.gpu`) with HF model cache volume
-- [ ] GPU benchmark — real PCIe bandwidth numbers on RunPod / Lambda Labs
