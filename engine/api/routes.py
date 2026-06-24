@@ -20,8 +20,10 @@ class InferenceResponse(BaseModel):
 @router.post("/infer", response_model=InferenceResponse)
 async def infer(body: InferenceRequest, request: Request):
     scheduler = request.app.state.scheduler
+    wm = request.app.state.engine.weight_manager
+    system_prompt = wm.get_system_prompt(body.adapter_id)
     try:
-        output = await scheduler.submit(body.prompt, body.adapter_id)
+        output = await scheduler.submit(body.prompt, body.adapter_id, system_prompt)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
@@ -33,6 +35,17 @@ async def infer(body: InferenceRequest, request: Request):
 async def cached_adapters(request: Request):
     wm = request.app.state.engine.weight_manager
     return {"cached": wm.cached_ids}
+
+
+@router.get("/adapters/list")
+async def list_adapters(request: Request):
+    wm = request.app.state.engine.weight_manager
+    return {
+        "adapters": [
+            {"id": aid, **wm.get_metadata(aid)}
+            for aid in wm.cached_ids
+        ]
+    }
 
 
 @router.post("/adapters/register-random")
@@ -57,8 +70,8 @@ async def load_from_hub(body: HubLoadRequest, request: Request):
     loader = request.app.state.adapter_loader
     wm = request.app.state.engine.weight_manager
     try:
-        weights = loader.load_from_hub(body.hub_repo_id)
-        wm.register(body.adapter_id, weights)
+        weights, metadata = loader.load_from_hub(body.hub_repo_id)
+        wm.register(body.adapter_id, weights, metadata)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"registered": body.adapter_id, "source": body.hub_repo_id}
@@ -69,8 +82,8 @@ async def load_from_dir(body: DirLoadRequest, request: Request):
     loader = request.app.state.adapter_loader
     wm = request.app.state.engine.weight_manager
     try:
-        weights = loader.load_from_dir(Path(body.path))
-        wm.register(body.adapter_id, weights)
+        weights, metadata = loader.load_from_dir(Path(body.path))
+        wm.register(body.adapter_id, weights, metadata)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"registered": body.adapter_id, "source": body.path}

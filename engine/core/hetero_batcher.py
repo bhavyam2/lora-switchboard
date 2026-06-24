@@ -33,8 +33,18 @@ class HeterogeneousBatchRunner:
         if not requests:
             return []
 
-        prompts = [r[0] for r in requests]
+        raw_prompts = [r[0] for r in requests]
         adapter_ids = [r[1] for r in requests]
+
+        # Apply chat template to each prompt so the chat model responds properly.
+        prompts = [
+            self.loader.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in raw_prompts
+        ]
 
         # Left-pad so all sequences end at the same position — required for
         # batched causal generation with decoder-only models.
@@ -67,8 +77,9 @@ class HeterogeneousBatchRunner:
             for layer in self.loader.lora_layers.values():
                 layer.clear_batch_adapters()
 
+        input_len = inputs["input_ids"].shape[1]
         return [
-            self.loader.tokenizer.decode(ids, skip_special_tokens=True)
+            self.loader.tokenizer.decode(ids[input_len:], skip_special_tokens=True)
             for ids in output_ids
         ]
 

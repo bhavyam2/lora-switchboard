@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,19 +23,40 @@ class InferenceEngine:
             device=self.loader.device,
         )
 
-    def run_inference(self, prompt: str) -> str:
-        return self.loader.run_inference(prompt)
+    def run_inference(self, prompt: str, system_prompt: str | None = None) -> str:
+        return self.loader.run_inference(prompt, system_prompt=system_prompt)
+
+
+def _autoload_adapters(engine: "InferenceEngine", adapter_loader: AdapterLoader) -> None:
+    """Load all adapters found in data/adapters/ that contain adapter_config.json."""
+    adapters_dir = Path("data/adapters")
+    if not adapters_dir.exists():
+        return
+    for adapter_dir in sorted(adapters_dir.iterdir()):
+        if not (adapter_dir / "adapter_config.json").exists():
+            continue
+        adapter_id = adapter_dir.name
+        try:
+            weights, metadata = adapter_loader.load_from_dir(adapter_dir)
+            engine.weight_manager.register(adapter_id, weights, metadata)
+            print(f"[Engine] Auto-loaded adapter: {adapter_id}")
+        except Exception as exc:
+            print(f"[Engine] Skipping {adapter_id}: {exc}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     engine = InferenceEngine()
+    adapter_loader = AdapterLoader()
+
+    _autoload_adapters(engine, adapter_loader)
+
     scheduler = RequestScheduler()
     scheduler.attach(engine)
 
     app.state.engine = engine
     app.state.scheduler = scheduler
-    app.state.adapter_loader = AdapterLoader()
+    app.state.adapter_loader = adapter_loader
     app.state.batcher = HeterogeneousBatchRunner(engine.loader, engine.weight_manager)
 
     dispatch_task = asyncio.create_task(scheduler.run())

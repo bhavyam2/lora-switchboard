@@ -20,7 +20,9 @@ class BaseModelLoader:
         self.lora_layers: dict[str, LoRALinear] = {}
 
         print(f"[Engine] Loading {self.model_id} onto {self.device}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, padding_side="left")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id).to(self.device)
 
         self._freeze_base()
@@ -51,15 +53,26 @@ class BaseModelLoader:
             parent = getattr(parent, part)
         setattr(parent, parts[-1], replacement)
 
-    def run_inference(self, prompt: str, max_new_tokens: int = 50) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+    def run_inference(
+        self, prompt: str, max_new_tokens: int = 100, system_prompt: str | None = None
+    ) -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=self.tokenizer.eos_token_id,
+                do_sample=False,
             )
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        input_len = inputs["input_ids"].shape[1]
+        return self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
 
 if __name__ == "__main__":

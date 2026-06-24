@@ -11,6 +11,7 @@ class InferenceRequest:
     prompt: str
     adapter_id: str
     future: asyncio.Future = field(repr=False)
+    system_prompt: str | None = None
 
 
 class RequestScheduler:
@@ -36,10 +37,17 @@ class RequestScheduler:
         """Bind the loaded engine (exposes .activate_adapter + .run_inference)."""
         self._engine = engine
 
-    async def submit(self, prompt: str, adapter_id: str) -> str:
+    async def submit(
+        self, prompt: str, adapter_id: str, system_prompt: str | None = None
+    ) -> str:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
-        request = InferenceRequest(prompt=prompt, adapter_id=adapter_id, future=future)
+        request = InferenceRequest(
+            prompt=prompt,
+            adapter_id=adapter_id,
+            future=future,
+            system_prompt=system_prompt,
+        )
         await self._queue.put(request)
         return await future
 
@@ -56,6 +64,7 @@ class RequestScheduler:
                     self._process,
                     req.prompt,
                     req.adapter_id,
+                    req.system_prompt,
                 )
                 req.future.set_result(result)
             except Exception as exc:
@@ -63,10 +72,10 @@ class RequestScheduler:
             finally:
                 self._queue.task_done()
 
-    def _process(self, prompt: str, adapter_id: str) -> str:
+    def _process(self, prompt: str, adapter_id: str, system_prompt: str | None) -> str:
         """Runs in the executor thread — all GPU ops happen here."""
         self._engine.weight_manager.activate(adapter_id)
-        return self._engine.run_inference(prompt)
+        return self._engine.run_inference(prompt, system_prompt=system_prompt)
 
     async def shutdown(self) -> None:
         self._running = False

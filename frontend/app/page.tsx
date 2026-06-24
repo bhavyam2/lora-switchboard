@@ -5,6 +5,12 @@ import { useState, useEffect, useCallback } from 'react'
 const API = 'http://localhost:8000'
 const CACHE_CAPACITY = 8
 
+interface AdapterInfo {
+  id: string
+  description?: string
+  system_prompt?: string
+}
+
 interface Result {
   output: string
   adapter_id: string
@@ -30,6 +36,7 @@ function Badge({ children, color = 'gray' }: { children: React.ReactNode; color?
     green:  'bg-[#0f2d1a] text-green-400  border-[#1a4731]',
     blue:   'bg-[#0c1f3d] text-blue-400   border-[#1a3560]',
     yellow: 'bg-[#2d2000] text-yellow-400 border-[#4a3800]',
+    purple: 'bg-[#1a0d2e] text-purple-400 border-[#3d1a5c]',
   }
   return (
     <span className={`text-xs px-2 py-0.5 rounded border font-mono ${colors[color]}`}>
@@ -43,7 +50,7 @@ function Badge({ children, color = 'gray' }: { children: React.ReactNode; color?
 function RequestPanel({
   prompt, setPrompt,
   adapterId, setAdapterId,
-  cachedAdapters,
+  adapters,
   onSend, onBatch,
   loading,
   newAdapterId, setNewAdapterId,
@@ -51,12 +58,14 @@ function RequestPanel({
 }: {
   prompt: string; setPrompt: (v: string) => void
   adapterId: string; setAdapterId: (v: string) => void
-  cachedAdapters: string[]
+  adapters: AdapterInfo[]
   onSend: () => void; onBatch: () => void
   loading: boolean
   newAdapterId: string; setNewAdapterId: (v: string) => void
   onRegister: () => void; registering: boolean
 }) {
+  const selectedAdapter = adapters.find(a => a.id === adapterId)
+
   return (
     <div className="flex flex-col gap-4 p-5 border-r border-[#30363d] overflow-y-auto">
       <p className="text-xs text-[#8b949e] uppercase tracking-widest">Request</p>
@@ -74,19 +83,26 @@ function RequestPanel({
 
       <div className="flex flex-col gap-1">
         <label className="text-xs text-[#8b949e]">Adapter</label>
-        {cachedAdapters.length === 0 ? (
-          <p className="text-xs text-[#8b949e] italic">No adapters loaded yet — register one below</p>
+        {adapters.length === 0 ? (
+          <p className="text-xs text-[#8b949e] italic">No adapters loaded yet</p>
         ) : (
-          <select
-            className="bg-[#010409] border border-[#30363d] rounded p-2 text-sm text-[#e6edf3]
-                       focus:outline-none focus:border-[#58a6ff] transition-colors"
-            value={adapterId}
-            onChange={e => setAdapterId(e.target.value)}
-          >
-            {cachedAdapters.map(id => (
-              <option key={id} value={id}>{id}</option>
-            ))}
-          </select>
+          <>
+            <select
+              className="bg-[#010409] border border-[#30363d] rounded p-2 text-sm text-[#e6edf3]
+                         focus:outline-none focus:border-[#58a6ff] transition-colors"
+              value={adapterId}
+              onChange={e => setAdapterId(e.target.value)}
+            >
+              {adapters.map(a => (
+                <option key={a.id} value={a.id}>{a.id}</option>
+              ))}
+            </select>
+            {selectedAdapter?.description && (
+              <p className="text-[10px] text-[#58a6ff] mt-1 leading-relaxed">
+                {selectedAdapter.description}
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -101,17 +117,17 @@ function RequestPanel({
         </button>
         <button
           onClick={onBatch}
-          disabled={loading || cachedAdapters.length < 2 || !prompt}
+          disabled={loading || adapters.length < 2 || !prompt}
           className="flex-1 py-2 px-4 rounded text-sm font-medium bg-[#1f6feb] hover:bg-[#388bfd]
                      disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           title="Sends prompt to all cached adapters in one batched forward pass"
         >
-          Batch
+          Batch all
         </button>
       </div>
 
       <div className="border-t border-[#30363d] pt-4 flex flex-col gap-2">
-        <p className="text-xs text-[#8b949e] uppercase tracking-widest">Register Adapter</p>
+        <p className="text-xs text-[#8b949e] uppercase tracking-widest">Register Custom Adapter</p>
         <div className="flex gap-2">
           <input
             className="flex-1 bg-[#010409] border border-[#30363d] rounded p-2 text-sm text-[#e6edf3]
@@ -131,7 +147,7 @@ function RequestPanel({
           </button>
         </div>
         <p className="text-[10px] text-[#8b949e]">
-          Registers a randomly-initialised adapter — simulates loading a real checkpoint.
+          Registers a randomly-initialised adapter to demonstrate LRU cache eviction.
         </p>
       </div>
     </div>
@@ -144,8 +160,19 @@ function OutputPanel({ results }: { results: Result[] }) {
       <div className="flex flex-col items-center justify-center h-full text-[#8b949e] gap-3 p-8">
         <div className="text-4xl opacity-20">⚡</div>
         <p className="text-sm">Send a request to see output here</p>
+        <p className="text-[11px] text-center max-w-xs leading-relaxed">
+          Select an adapter and a prompt. Try{' '}
+          <em>&quot;What is recursion?&quot;</em> with each adapter to see how their styles differ.
+        </p>
       </div>
     )
+  }
+
+  const adapterColor = (id: string) => {
+    if (id === 'code-assistant') return 'green'
+    if (id === 'analyst') return 'blue'
+    if (id === 'creative') return 'purple'
+    return 'gray'
   }
 
   return (
@@ -159,13 +186,13 @@ function OutputPanel({ results }: { results: Result[] }) {
           } p-4 flex flex-col gap-3`}
         >
           <div className="flex items-center gap-2 flex-wrap">
-            <Badge color={r.batch ? 'blue' : 'green'}>
+            <Badge color={r.batch ? 'blue' : adapterColor(r.adapter_id)}>
               {r.batch ? 'batch' : 'single'}
             </Badge>
-            <Badge color="gray">{r.adapter_id}</Badge>
+            <Badge color={adapterColor(r.adapter_id)}>{r.adapter_id}</Badge>
             <Badge color="yellow">{r.latency_ms.toFixed(0)}ms</Badge>
           </div>
-          <pre className="text-sm text-[#e6edf3] whitespace-pre-wrap leading-relaxed">
+          <pre className="text-sm text-[#e6edf3] whitespace-pre-wrap leading-relaxed font-mono">
             {r.output}
           </pre>
         </div>
@@ -175,14 +202,21 @@ function OutputPanel({ results }: { results: Result[] }) {
 }
 
 function CachePanel({
-  cachedAdapters,
+  adapters,
   serverOnline,
 }: {
-  cachedAdapters: string[]
+  adapters: AdapterInfo[]
   serverOnline: boolean
 }) {
-  const filledSlots = cachedAdapters.length
+  const filledSlots = adapters.length
   const pct = Math.round((filledSlots / CACHE_CAPACITY) * 100)
+
+  const adapterColor = (id: string) => {
+    if (id === 'code-assistant') return 'text-green-400'
+    if (id === 'analyst') return 'text-blue-400'
+    if (id === 'creative') return 'text-purple-400'
+    return 'text-[#e6edf3]'
+  }
 
   return (
     <div className="flex flex-col gap-4 p-5 border-l border-[#30363d] overflow-y-auto">
@@ -207,19 +241,24 @@ function CachePanel({
       </div>
 
       <div className="flex flex-col gap-2">
-        {cachedAdapters.length === 0 ? (
-          <p className="text-xs text-[#8b949e] italic">Empty — register an adapter to get started</p>
+        {adapters.length === 0 ? (
+          <p className="text-xs text-[#8b949e] italic">Empty</p>
         ) : (
-          cachedAdapters.map(id => (
-            <div key={id} className="flex items-start gap-2 text-sm">
+          adapters.map(a => (
+            <div key={a.id} className="flex items-start gap-2">
               <Dot active />
-              <span className="text-[#e6edf3] break-all">{id}</span>
+              <div className="flex flex-col gap-0.5">
+                <span className={`text-sm font-medium ${adapterColor(a.id)}`}>{a.id}</span>
+                {a.description && (
+                  <span className="text-[10px] text-[#8b949e] leading-tight">{a.description}</span>
+                )}
+              </div>
             </div>
           ))
         )}
       </div>
 
-      {cachedAdapters.length > 0 && (
+      {adapters.length > 0 && (
         <div className="border-t border-[#30363d] pt-3 text-[10px] text-[#8b949e] leading-relaxed">
           Hot adapters are resident in device memory. Cache misses trigger a CPU→GPU transfer and evict the LRU entry.
         </div>
@@ -231,24 +270,25 @@ function CachePanel({
 // ── root ────────────────────────────────────────────────────────────────────
 
 export default function Home() {
-  const [prompt, setPrompt]               = useState('Analyze the following system metrics:')
+  const [prompt, setPrompt]               = useState('Explain how recursion works.')
   const [adapterId, setAdapterId]         = useState('')
   const [newAdapterId, setNewAdapterId]   = useState('')
-  const [cachedAdapters, setCachedAdapters] = useState<string[]>([])
+  const [adapters, setAdapters]           = useState<AdapterInfo[]>([])
   const [results, setResults]             = useState<Result[]>([])
   const [loading, setLoading]             = useState(false)
   const [registering, setRegistering]     = useState(false)
   const [error, setError]                 = useState<string | null>(null)
   const [serverOnline, setServerOnline]   = useState(false)
 
-  const fetchCache = useCallback(async () => {
+  const fetchAdapters = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/v1/adapters/cached`)
+      const res = await fetch(`${API}/api/v1/adapters/list`)
       const data = await res.json()
-      setCachedAdapters(data.cached ?? [])
+      const list: AdapterInfo[] = data.adapters ?? []
+      setAdapters(list)
       setServerOnline(true)
-      if (data.cached?.length > 0 && !adapterId) {
-        setAdapterId(data.cached[0])
+      if (list.length > 0 && !adapterId) {
+        setAdapterId(list[0].id)
       }
     } catch {
       setServerOnline(false)
@@ -256,10 +296,10 @@ export default function Home() {
   }, [adapterId])
 
   useEffect(() => {
-    fetchCache()
-    const id = setInterval(fetchCache, 2000)
+    fetchAdapters()
+    const id = setInterval(fetchAdapters, 2000)
     return () => clearInterval(id)
-  }, [fetchCache])
+  }, [fetchAdapters])
 
   const registerAdapter = async () => {
     if (!newAdapterId.trim()) return
@@ -270,7 +310,7 @@ export default function Home() {
       })
       if (!adapterId) setAdapterId(newAdapterId)
       setNewAdapterId('')
-      await fetchCache()
+      await fetchAdapters()
     } finally {
       setRegistering(false)
     }
@@ -297,28 +337,28 @@ export default function Home() {
       setError(e instanceof Error ? e.message : 'Unknown error')
     } finally {
       setLoading(false)
-      fetchCache()
+      fetchAdapters()
     }
   }
 
   const sendBatch = async () => {
-    if (!prompt || cachedAdapters.length < 2) return
+    if (!prompt || adapters.length < 2) return
     setLoading(true)
     setError(null)
     const t0 = performance.now()
-    const adapters = cachedAdapters.slice(0, 4)
+    const targetAdapters = adapters.slice(0, 4)
     try {
       const res = await fetch(`${API}/api/v1/batch-infer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          requests: adapters.map(id => ({ prompt, adapter_id: id })),
-          max_new_tokens: 50,
+          requests: targetAdapters.map(a => ({ prompt, adapter_id: a.id })),
+          max_new_tokens: 80,
         }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Batch failed')
-      const perRequest = (performance.now() - t0) / adapters.length
+      const perRequest = (performance.now() - t0) / targetAdapters.length
       setResults(prev => [
         ...data.outputs.map((o: { output: string; adapter_id: string }) => ({
           output: o.output,
@@ -332,7 +372,7 @@ export default function Home() {
       setError(e instanceof Error ? e.message : 'Unknown error')
     } finally {
       setLoading(false)
-      fetchCache()
+      fetchAdapters()
     }
   }
 
@@ -345,7 +385,7 @@ export default function Home() {
           <span className="font-bold tracking-tight">lora-switchboard</span>
         </div>
         <span className="text-[#8b949e] text-sm hidden sm:block">
-          multi-tenant LoRA inference engine
+          multi-tenant LoRA inference · Qwen1.5-0.5B-Chat + 3 fine-tuned adapters
         </span>
         {error && (
           <span className="ml-auto text-xs text-red-400 truncate max-w-sm">{error}</span>
@@ -353,18 +393,18 @@ export default function Home() {
       </header>
 
       {/* Three-column layout */}
-      <div className="flex-1 grid grid-cols-[300px_1fr_240px] min-h-0">
+      <div className="flex-1 grid grid-cols-[300px_1fr_260px] min-h-0">
         <RequestPanel
           prompt={prompt} setPrompt={setPrompt}
           adapterId={adapterId} setAdapterId={setAdapterId}
-          cachedAdapters={cachedAdapters}
+          adapters={adapters}
           onSend={sendSingle} onBatch={sendBatch}
           loading={loading}
           newAdapterId={newAdapterId} setNewAdapterId={setNewAdapterId}
           onRegister={registerAdapter} registering={registering}
         />
         <OutputPanel results={results} />
-        <CachePanel cachedAdapters={cachedAdapters} serverOnline={serverOnline} />
+        <CachePanel adapters={adapters} serverOnline={serverOnline} />
       </div>
     </main>
   )

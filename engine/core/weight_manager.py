@@ -9,6 +9,8 @@ from engine.core.lora_layer import LoRALinear
 
 AdapterWeights = dict[str, tuple[torch.Tensor, torch.Tensor]]  # layer_path -> (A, B)
 
+AdapterMetadata = dict  # optional: description, system_prompt, etc.
+
 
 class WeightManager:
     """
@@ -31,6 +33,9 @@ class WeightManager:
 
         # CPU registry — holds all registered adapters (CPU tensors, persistent)
         self._registry: dict[str, AdapterWeights] = {}
+
+        # Metadata registry — description, system_prompt, etc.
+        self._metadata: dict[str, AdapterMetadata] = {}
 
         # GPU cache — LRU-ordered subset of the registry (GPU tensors, bounded)
         self._gpu_cache: OrderedDict[str, AdapterWeights] = OrderedDict()
@@ -61,10 +66,25 @@ class WeightManager:
             layer.unload_adapter()
         self._active_adapter = None
 
-    def register(self, adapter_id: str, weights: AdapterWeights) -> None:
+    def register(
+        self,
+        adapter_id: str,
+        weights: AdapterWeights,
+        metadata: AdapterMetadata | None = None,
+    ) -> None:
         """Register pre-parsed CPU-side weights (e.g. from AdapterLoader)."""
         self._registry[adapter_id] = weights
+        if metadata:
+            self._metadata[adapter_id] = metadata
         self._promote_to_gpu(adapter_id, weights)
+
+    def get_system_prompt(self, adapter_id: str) -> str | None:
+        """Return the system prompt for an adapter, if any."""
+        meta = self._metadata.get(adapter_id, {})
+        return meta.get("system_prompt")
+
+    def get_metadata(self, adapter_id: str) -> AdapterMetadata:
+        return self._metadata.get(adapter_id, {})
 
     def register_random_adapter(self, adapter_id: str) -> None:
         """Randomly-initialised adapter — for testing and benchmarking."""

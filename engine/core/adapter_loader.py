@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import snapshot_download
 
-from engine.core.weight_manager import AdapterWeights
+from engine.core.weight_manager import AdapterWeights, AdapterMetadata
 
 
 class AdapterLoader:
@@ -22,7 +22,7 @@ class AdapterLoader:
 
     _PREFIX = "base_model.model."
 
-    def load_from_hub(self, hub_repo_id: str) -> AdapterWeights:
+    def load_from_hub(self, hub_repo_id: str) -> tuple[AdapterWeights, AdapterMetadata]:
         print(f"[AdapterLoader] Downloading '{hub_repo_id}' from HuggingFace Hub...")
         local_dir = snapshot_download(
             repo_id=hub_repo_id,
@@ -30,18 +30,26 @@ class AdapterLoader:
         )
         return self.load_from_dir(Path(local_dir))
 
-    def load_from_dir(self, adapter_dir: Path) -> AdapterWeights:
+    def load_from_dir(self, adapter_dir: Path) -> tuple[AdapterWeights, AdapterMetadata]:
         adapter_dir = Path(adapter_dir)
         config = self._load_config(adapter_dir)
         raw = self._load_weights(adapter_dir)
         weights = self._parse(raw)
+        metadata = self._load_metadata(adapter_dir)
         print(
             f"[AdapterLoader] Loaded {len(weights)} layer(s) "
             f"(rank={config.get('r')}, targets={config.get('target_modules')})"
         )
-        return weights
+        return weights, metadata
 
     # ------------------------------------------------------------------
+
+    def _load_metadata(self, adapter_dir: Path) -> AdapterMetadata:
+        info_path = adapter_dir / "adapter_info.json"
+        if info_path.exists():
+            with open(info_path) as f:
+                return json.load(f)
+        return {}
 
     def _load_config(self, adapter_dir: Path) -> dict:
         path = adapter_dir / "adapter_config.json"

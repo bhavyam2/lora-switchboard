@@ -1,5 +1,5 @@
 """
-Generates a properly-formatted PEFT LoRA adapter for EleutherAI/pythia-70m
+Generates a properly-formatted PEFT LoRA adapter for Qwen/Qwen1.5-0.5B-Chat
 and saves it to data/adapters/test-peft-adapter/.
 
 The weights are randomly initialised — this is purely for validating that
@@ -16,12 +16,12 @@ from transformers import AutoModelForCausalLM
 OUTPUT_DIR = Path("data/adapters/test-peft-adapter")
 
 print("Loading base model...")
-model = AutoModelForCausalLM.from_pretrained("EleutherAI/pythia-70m")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen1.5-0.5B-Chat")
 
 config = LoraConfig(
     r=8,
     lora_alpha=16,
-    target_modules=["query_key_value"],
+    target_modules=["q_proj", "v_proj"],
     lora_dropout=0.0,
     bias="none",
 )
